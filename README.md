@@ -1,1 +1,0 @@
-# Organizacion_industrial
