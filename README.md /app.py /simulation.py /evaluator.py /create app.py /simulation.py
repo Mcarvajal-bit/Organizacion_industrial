@@ -1,138 +1,294 @@
-import numpy as np
-
-
-def cr_k(s, k=4):
-    """Ratio de concentración: suma de las k mayores cuotas."""
-    s = np.asarray(s, float)
-    return np.sort(s, axis=-1)[..., ::-1][..., :k].sum(axis=-1)
-
-
-def ihh(s):
-    """Herfindahl-Hirschman en escala 0-1 (x10.000 para la escala clásica)."""
-    return (np.asarray(s, float) ** 2).sum(axis=-1)
-
-
-def dominancia(s):
-    """Índice de Dominancia (García Alba): suma de h_i^2, con h_i = s_i^2 / IHH."""
-    sq = np.asarray(s, float) ** 2
-    h = sq / sq.sum(axis=-1, keepdims=True)
-    return (h ** 2).sum(axis=-1)
-
-
-def entropia(s):
-    """Entropía de Shannon: -sum(s_i * ln s_i). Máximo = ln(N)."""
-    s = np.asarray(s, float)
-    seguro = np.where(s > 0, s, 1.0)  # evita log(0)
-    return -(s * np.log(seguro)).sum(axis=-1)
-
-
-# Para agregar o cambiar un indicador a futuro, edita solo este diccionario
-INDICADORES = {
-    "CRk": {"nombre": "Ratio de Concentración (CRk)", "eje": "CRk (proporción, 0-1)", "f": cr_k},
-    "IHH": {"nombre": "Índice Herfindahl-Hirschman (IHH)", "eje": "IHH (escala 0-1)", "f": ihh},
-    "ID":  {"nombre": "Índice de Dominancia (ID)", "eje": "ID (adimensional)", "f": dominancia},
-    "IE":  {"nombre": "Índice de Entropía (IE)", "eje": "IE (nats)", "f": entropia},
-}
-def calcular(clave, s, k=4):
-    f = INDICADORES[clave]["f"]
-    return f(s, k) if clave == "CRk" else f(s)
-import numpy as np
+pip install -r requirements.txt
+streamlit>=1.28.0
+numpy>=1.24.0
+pandas>=2.0.0
+plotly>=5.15.0
+scipy>=1.10.0
 import streamlit as st
-from indicators import INDICADORES, calcular
-
-st.set_page_config(page_title="Simulador de Concentración", layout="wide")
-st.title("Simulador de Concentración de Mercado")
-
-with st.sidebar:
-    st.header("Parámetros")
-    clave = st.selectbox("Indicador", list(INDICADORES),
-                         format_func=lambda c: INDICADORES[c]["nombre"])
-    n = st.number_input("Número de empresas (N)", min_value=2, max_value=100, value=10)
-    k = st.number_input("k (solo CRk)", 1, int(n), min(4, int(n))) if clave == "CRk" else 4
-
-# Prueba: mercado con cuotas iguales
-s = np.full(int(n), 1 / n)
-st.write(f"{clave} con cuotas iguales: **{float(calcular(clave, s, int(k))):.4f}**")
 import numpy as np
-import streamlit as st
-import matplotlib.pyplot as plt
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
 
-from indicators import INDICADORES, calcular
-from simulation import (simular, cuotas_aleatorias, percentil,
-                        ITER_DEFECTO, ITER_MIN, ITER_MAX)
-from evaluator import CATEGORIAS, evaluar
+# -----------------------------------------------------------------------------
+# CONFIGURACIÓN DE LA PÁGINA
+# -----------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Simulador de Concentración de Mercado",
+    page_icon="📊",
+    layout="wide"
+)
 
-st.set_page_config(page_title="Simulador de Concentración", layout="wide")
-st.title("Simulador de Concentración de Mercado (Monte Carlo)")
+st.title("📊 Simulador Interactivo y Evaluador de Concentración de Mercado")
+st.markdown("Organización Industrial - Método de Monte Carlo")
 
-# ---------- PASO 1 + 3: parámetros (indicador, N, iteraciones, advertencia) ----------
-with st.sidebar:
-    st.header("Parámetros")
-    clave = st.selectbox("Indicador", list(INDICADORES),
-                         format_func=lambda c: INDICADORES[c]["nombre"])
-    n = st.number_input("Número de empresas (N)", 2, 100, 10)
-    k = st.number_input("k (solo CRk)", 1, int(n), min(4, int(n))) if clave == "CRk" else 4
-    iters = st.number_input("Iteraciones", ITER_MIN, ITER_MAX, ITER_DEFECTO, step=100,
-                            help=f"Rango {ITER_MIN}-{ITER_MAX:,}: menos da una distribución inestable; "
-                                 "más ralentiza la web.")
-    if iters > 10_000:
-        st.warning("⚠️ Más iteraciones aumentan el tiempo de respuesta, la memoria y el uso de CPU.")
-    seed = st.number_input("Semilla (0 = aleatoria)", 0, 10**6, 0)
+# -----------------------------------------------------------------------------
+# FUNCIONES MATEMÁTICAS (MÓDULO 1: INDICADORES)
+# -----------------------------------------------------------------------------
+def calcular_crk(s, k=4):
+    """Ratio de Concentración CRk."""
+    s_sorted = np.sort(s)[::-1]
+    return float(np.sum(s_sorted[:k]))
 
-# ---------- PASO 4: caso particular (manual o aleatorio) ----------
-st.subheader("1. Caso particular")
-modo = st.radio("Modo", ["Entrada manual", "Generación aleatoria"], horizontal=True)
-cuotas = None
+def calcular_ihh(s):
+    """Índice de Herfindahl-Hirschman (en escala 0 a 10,000)."""
+    return float(np.sum((s * 100) ** 2))
 
-if modo == "Entrada manual":
-    por_defecto = ", ".join([f"{100/n:.2f}"] * int(n))
-    txt = st.text_area("Cuotas en % separadas por coma (deben sumar 100)", por_defecto)
-    try:
-        v = np.array([float(x) for x in txt.replace(";", ",").split(",") if x.strip()])
-        if len(v) != n:
-            st.error(f"Ingresaste {len(v)} cuotas y N = {n}.")
-        elif (v < 0).any() or (v > 100).any():
-            st.error("Cada cuota debe estar entre 0% y 100%.")
-        elif not np.isclose(v.sum(), 100, atol=0.01):
-            st.error(f"Las cuotas suman {v.sum():.2f}%, deben sumar 100%.")
-        else:
-            cuotas = v / 100
-    except ValueError:
-        st.error("Formato inválido: usa números separados por coma.")
-else:
-    if st.button("Generar caso aleatorio") or "caso" not in st.session_state:
-        st.session_state["caso"] = cuotas_aleatorias(int(n))[0]
-    if len(st.session_state["caso"]) != n:
-        st.session_state["caso"] = cuotas_aleatorias(int(n))[0]
-    cuotas = st.session_state["caso"]
-    st.write(", ".join(f"{x*100:.2f}%" for x in cuotas))
+def calcular_id(s):
+    """Índice de Dominancia (ID)."""
+    s_sorted = np.sort(s)[::-1]
+    h = np.sum(s ** 2)
+    if h == 0:
+        return 0.0
+    # Fórmula estandarizada de ID basada en asimetría de cuotas
+    id_val = np.sum((s_sorted ** 4) / (h ** 2))
+    return float(id_val)
 
-if cuotas is not None:
-    # ---------- PASO 2 + 5: simulación, valor del caso y percentil ----------
-    dist = simular(clave, int(n), int(iters), int(k), seed or None)
-    valor = float(calcular(clave, cuotas, int(k)))
-    pct = percentil(dist, valor)
+def calcular_ie(s):
+    """Índice de Entropía (IE)."""
+    # Evitar logaritmo de cero
+    s_safe = np.where(s > 0, s, 1e-12)
+    return float(np.sum(s_safe * np.log(1.0 / s_safe)))
 
-    st.subheader("2. Distribución de Monte Carlo")
-    c1, c2 = st.columns(2)
-    c1.metric(f"{clave} del caso", f"{valor:.4f}")
-    c2.metric("Percentil", f"{pct:.1f}")
+def calcular_indicador(s, nombre_indicador, k_val=4):
+    if nombre_indicador == "Ratio de Concentración (CRk)":
+        return calcular_crk(s, k=k_val)
+    elif nombre_indicador == "Índice de Herfindahl-Hirschman (IHH)":
+        return calcular_ihh(s)
+    elif nombre_indicador == "Índice de Dominancia (ID)":
+        return calcular_id(s)
+    elif nombre_indicador == "Índice de Entropía (IE)":
+        return calcular_ie(s)
+    return 0.0
 
-    # ---------- PASO 5: histograma + línea vertical del caso ----------
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.hist(dist, bins=40, color="#6c8ebf", edgecolor="white", density=True)
-    ax.axvline(valor, color="red", lw=2, label=f"Caso particular = {valor:.4f}")
-    ax.set_xlabel(INDICADORES[clave]["eje"])
-    ax.set_ylabel("Densidad")
-    ax.set_title(f"{int(iters):,} simulaciones, N = {int(n)}")
-    ax.legend()
-    st.pyplot(fig)
-
-    # ---------- PASO 6: evaluador ----------
-    st.subheader("3. Evaluador")
-    resp = st.radio("¿Qué nivel de concentración tiene el caso particular?",
-                    CATEGORIAS, horizontal=True)
-    if st.button("Verificar respuesta"):
-        ok, msg = evaluar(clave, valor, int(n), resp, pct)
-        (st.success if ok else st.error)(("✅ Correcto. " if ok else "❌ Incorrecto. ") + msg)
+# -----------------------------------------------------------------------------
+# MÓDULO 2: MOTOR DE SIMULACIÓN DE MONTE CARLO
+# -----------------------------------------------------------------------------
+def simular_monte_carlo(n_empresas, n_iteraciones, indicador_nombre, k_val=4):
+    """
+    Genera vectores de cuotas usando la distribución Dirichlet(1,...,1),
+    garantizando estrictamente sum(s_i) = 1.0 en cada iteración.
+    """
+    # Dirichlet uniformemente distribuida sobre el símplex sum(s_i) = 1
+    alpha = np.ones(n_empresas)
+    cuotas_simuladas = np.random.dirichlet(alpha, size=n_iteraciones)
+    
+    resultados = np.zeros(n_iteraciones)
+    for i in range(n_iteraciones):
+        resultados[i] = calcular_indicador(cuotas_simuladas[i], indicador_nombre, k_val)
         
+    return resultados
+
+# -----------------------------------------------------------------------------
+# BARRA LATERAL: PARÁMETROS Y CONFIGURACIÓN
+# -----------------------------------------------------------------------------
+st.sidebar.header("⚙️ Configuración del Mercado")
+
+# Selección de Indicador
+indicador_sel = st.sidebar.selectbox(
+    "Seleccione el Indicador de Concentración:",
+    [
+        "Índice de Herfindahl-Hirschman (IHH)",
+        "Ratio de Concentración (CRk)",
+        "Índice de Dominancia (ID)",
+        "Índice de Entropía (IE)"
+    ]
+)
+
+k_param = 4
+if indicador_sel == "Ratio de Concentración (CRk)":
+    k_param = st.sidebar.slider("Valor de k (para CRk):", min_value=1, max_value=10, value=4)
+
+# Número de Empresas (N entre 2 y 100)
+n_empresas = st.sidebar.number_input(
+    "Número de Empresas (N):",
+    min_value=2,
+    max_value=100,
+    value=10,
+    step=1
+)
+
+st.sidebar.subheader("🎲 Parámetros de Monte Carlo")
+n_iter = st.sidebar.number_input(
+    "Número de Iteraciones:",
+    min_value=100,
+    max_value=50000,
+    value=1000,
+    step=500
+)
+
+# Advertencia de Carga Computacional
+if n_iter > 5000:
+    st.sidebar.warning(
+        "⚠️ **Advertencia de Carga Computacional:** "
+        "Incrementar las iteraciones por encima de 5,000 puede aumentar la latencia "
+        "y el uso de recursos de procesamiento web."
+    )
+
+# -----------------------------------------------------------------------------
+# SECCIÓN PRINCIPAL: CASO PARTICULAR
+# -----------------------------------------------------------------------------
+st.header("📌 1. Definición del Caso Particular")
+
+col1, col2 = st.columns([1, 2])
+
+with col1:
+    modo_ingreso = st.radio(
+        "Método para definir cuotas del caso particular:",
+        ["Generación Aleatoria Puntual", "Entrada Manual"]
+    )
+
+cuotas_caso = []
+
+if modo_ingreso == "Generación Aleatoria Puntual":
+    if st.button("🎲 Generar Nuevo Caso Aleatorio") or "cuotas_aleatorias" not in st.session_state:
+        raw_cuotas = np.random.dirichlet(np.ones(n_empresas))
+        st.session_state["cuotas_aleatorias"] = raw_cuotas
+    cuotas_caso = st.session_state["cuotas_aleatorias"]
+else:
+    st.markdown("Ingrese el porcentaje de cuota de mercado para cada empresa (%):")
+    cuotas_input = []
+    cols_input = st.columns(min(n_empresas, 5))
+    for i in range(n_empresas):
+        col_idx = i % 5
+        val = cols_input[col_idx].number_input(
+            f"Empresa {i+1} (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=round(100.0 / n_empresas, 2),
+            key=f"emp_{i}"
+        )
+        cuotas_input.append(val)
+    
+    # Validar que sumen 100%
+    suma_ingresada = sum(cuotas_input)
+    if not np.isclose(suma_ingresada, 100.0, atol=0.1):
+        st.error(f"❌ La suma de las cuotas debe ser 100%. Suma actual: {suma_ingresada:.2f}%")
+        st.stop()
+    else:
+        cuotas_caso = np.array(cuotas_input) / 100.0
+
+# Calcular indicador para el caso particular
+valor_caso = calcular_indicador(cuotas_caso, indicador_sel, k_param)
+
+with col2:
+    st.subheader("Cuotas de Mercado del Caso Particular")
+    df_cuotas = pd.DataFrame({
+        "Empresa": [f"Empresa {i+1}" for i in range(n_empresas)],
+        "Cuota (%)": np.round(cuotas_caso * 100, 2)
+    })
+    
+    fig_pie = px.pie(df_cuotas, values="Cuota (%)", names="Empresa", title="Distribución del Caso Particular")
+    fig_pie.update_layout(height=300)
+    st.plotly_chart(fig_pie, use_container_width=True)
+
+# -----------------------------------------------------------------------------
+# MÓDULO 3: SIMULACIÓN DE MONTE CARLO Y GRÁFICO COMPARATIVO
+# -----------------------------------------------------------------------------
+st.header("📈 2. Simulación de Monte Carlo y Comparación")
+
+# Ejecutar simulación
+simulaciones = simular_monte_carlo(n_empresas, n_iter, indicador_sel, k_param)
+
+# Calcular Percentil del Caso Particular
+percentil = (np.sum(simulaciones <= valor_caso) / len(simulaciones)) * 100
+
+col_m1, col_m2, col_m3 = st.columns(3)
+col_m1.metric("Valor Caso Particular", f"{valor_caso:.4f}")
+col_m2.metric("Promedio Simulado", f"{np.mean(simulaciones):.4f}")
+col_m3.metric("Posición (Percentil)", f"{percentil:.1f}%")
+
+# Graficar Distribución con Marcador del Caso Particular
+fig_dist = go.Figure()
+
+# Histograma de Monte Carlo
+fig_dist.add_trace(go.Histogram(
+    x=simulaciones,
+    histnorm='probability density',
+    name='Simulación Monte Carlo',
+    marker_color='#1f77b4',
+    opacity=0.75
+))
+
+# Línea vertical del Caso Particular
+fig_dist.add_vline(
+    x=valor_caso,
+    line_width=3,
+    line_dash="dash",
+    line_color="red",
+    annotation_text=f"Caso Particular ({valor_caso:.2f})",
+    annotation_position="top right"
+)
+
+fig_dist.update_layout(
+    title=f"Distribución Estocástica de Monte Carlo ({n_iter} iteraciones)",
+    xaxis_title=f"Valor del Indicador: {indicador_sel}",
+    yaxis_title="Densidad de Probabilidad",
+    template="plotly_white",
+    height=450
+)
+
+st.plotly_chart(fig_dist, use_container_width=True)
+
+# -----------------------------------------------------------------------------
+# MÓDULO 4: EVALUADOR DE CONCENTRACIÓN Y RETROALIMENTACIÓN
+# -----------------------------------------------------------------------------
+st.header("📝 3. Evaluador de Concentración y Retroalimentación Pedagógica")
+
+st.subheader("Cuestionario de Evaluación")
+
+opciones_eval = ["Baja Concentración / Mercado Competitivo", "Concentración Moderada", "Alta Concentración / Mercado Concentrado"]
+respuesta_usuario = st.radio(
+    "Según los resultados obtenidos, ¿cómo clasificaría el nivel de concentración de este caso particular?",
+    opciones_eval
+)
+
+if st.button("Evaluar Respuesta"):
+    # Lógica de umbrales según el indicador seleccionado
+    clasificacion_teorica = ""
+    justificacion = ""
+
+    if indicador_sel == "Índice de Herfindahl-Hirschman (IHH)":
+        if valor_caso < 1500:
+            clasificacion_teorica = "Baja Concentración / Mercado Competitivo"
+            justificacion = "Un IHH inferior a 1,500 puntos indica un mercado desconcentrado o competitivo según los estándares internacionales (ej. DoJ / FTC)."
+        elif 1500 <= valor_caso <= 2500:
+            clasificacion_teorica = "Concentración Moderada"
+            justificacion = "Un IHH entre 1,500 y 2,500 puntos corresponde a un mercado moderadamente concentrado."
+        else:
+            clasificacion_teorica = "Alta Concentración / Mercado Concentrado"
+            justificacion = "Un IHH superior a 2,500 puntos representa un mercado altamente concentrado."
+
+    elif indicador_sel == "Ratio de Concentración (CRk)":
+        cr_pct = valor_caso * 100 if valor_caso <= 1.0 else valor_caso
+        if cr_pct < 40:
+            clasificacion_teorica = "Baja Concentración / Mercado Competitivo"
+            justificacion = f"Un CR{k_param} menor al 40% refleja una estructura competitiva o atomizada."
+        elif 40 <= cr_pct <= 70:
+            clasificacion_teorica = "Concentración Moderada"
+            justificacion = f"Un CR{k_param} entre 40% y 70% sugiere una concentración moderada u oligopolio débil."
+        else:
+            clasificacion_teorica = "Alta Concentración / Mercado Concentrado"
+            justificacion = f"Un CR{k_param} superior al 70% indica un oligopolio estrecho o alta concentración."
+
+    else:
+        # Umbrales basados en percentiles de la simulación para ID e IE
+        if percentil < 33:
+            clasificacion_teorica = "Baja Concentración / Mercado Competitivo"
+            justificacion = f"El valor del indicador se sitúa en el percentil {percentil:.1f}% de la distribución estocástica, lo que indica una concentración baja respecto a la norma simulada."
+        elif 33 <= percentil <= 66:
+            clasificacion_teorica = "Concentración Moderada"
+            justificacion = f"El valor se sitúa en el percentil {percentil:.1f}%, reflejando una concentración intermedia."
+        else:
+            clasificacion_teorica = "Alta Concentración / Mercado Concentrado"
+            justificacion = f"El valor se sitúa en el percentil {percentil:.1f}%, estando entre los escenarios de mayor concentración."
+
+    # Retroalimentación automatizada
+    if respuesta_usuario == clasificacion_teorica:
+        st.success(f"✅ **¡Correcto!** {justificacion}")
+    else:
+        st.error(f"❌ **Incorrecto.** La clasificación adecuada es: **{clasificacion_teorica}**.")
+        st.info(f"💡 **Justificación Técnica:** {justificacion}")
+
+    st.markdown(f"**Posición Cuantitativa Relativa:** El caso particular se ubica en el **percentil {percentil:.1f}%** de la distribución empírica de Monte Carlo.")
+    
